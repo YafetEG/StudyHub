@@ -1,22 +1,18 @@
 // =========================================================
-// StudyHub — Node.js backend server
-// =========================================================
-// This server acts as a middleman between the frontend and
-// the StudentVUE API. It receives credentials from the
-// frontend, forwards them to StudentVUE, and returns grade
-// data. Credentials are NEVER logged or stored anywhere.
-// =========================================================
+// StudyHub backend server
+// ========================================================
 
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const studentVueModule = require('studentvue');
 const studentVueApi = studentVueModule.default || studentVueModule;
+const xmlFactoryModule = require('studentvue/lib/utils/XMLFactory/XMLFactory');
+const XMLFactory = xmlFactoryModule.default || xmlFactoryModule;
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// MCPS StudentVUE domain
 const DISTRICT_URL = 'https://md-mcps-psv.edupoint.com';
 
 function sanitizeErrorMessage(err) {
@@ -33,7 +29,6 @@ function sanitizeErrorMessage(err) {
 function classifyStudentVueError(message) {
   const msg = String(message || '').toLowerCase();
 
-  // Catch parsing crashes and incomplete data from StudentVUE
   if (
     msg.includes('cannot read properties') ||
     msg.includes('undefined') ||
@@ -87,93 +82,178 @@ function classifyStudentVueError(message) {
   };
 }
 
-// =========================================================
-// Middleware
-// =========================================================
+function toArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value === null || value === undefined) return [];
+  return [value];
+}
+
+function first(value) {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function decodeValue(value) {
+  if (value === null || value === undefined) return '';
+  const text = String(value);
+  try {
+    return decodeURI(text);
+  } catch (e) {
+    return text;
+  }
+}
+
+function readRawAttr(node, key, fallback) {
+  const value = first(node && node[key]);
+  if (value === null || value === undefined || value === '') return fallback;
+  return decodeValue(value);
+}
+
+function readRawNumber(node, key) {
+  const value = Number(readRawAttr(node, key, ''));
+  return Number.isFinite(value) ? value : null;
+}
+
+function normalizeLibraryGradebook(gradebook) {
+  return {
+    courses: toArray(gradebook && gradebook.courses).map(function(course) {
+      const mark = toArray(course && course.marks)[0] || null;
+      return {
+        name: course && course.title ? course.title : 'Unknown Class',
+        teacher: course && course.staff && course.staff.name ? course.staff.name : '',
+        grade: mark && mark.calculatedScore && mark.calculatedScore.string ? mark.calculatedScore.string : 'N/A',
+        score: mark && mark.calculatedScore ? mark.calculatedScore.raw : null,
+        assignments: toArray(mark && mark.assignments).map(function(assignment) {
+          return {
+            name: assignment && assignment.name ? assignment.name : 'Assignment',
+            category: assignment && assignment.type ? assignment.type : '',
+            score: assignment && assignment.score && assignment.score.value ? assignment.score.value : 'Not Graded',
+            maxScore: assignment && assignment.score && assignment.score.type ? assignment.score.type : '',
+            date: assignment && assignment.date && assignment.date.start ? assignment.date.start : '',
+            notes: assignment && assignment.notes ? assignment.notes : ''
+          };
+        })
+      };
+    }),
+    reportingPeriod: gradebook && gradebook.reportingPeriod ? gradebook.reportingPeriod : null
+  };
+}
+
+async function fetchRawGradebook(client, quarter) {
+  const xmlObject = await client.processRequest({
+    methodName: 'Gradebook',
+    paramStr: {
+      childIntId: 0,
+      ...(quarter !== null && quarter !== undefined ? { ReportPeriod: quarter } : {})
+    }
+  }, function(xml) {
+    return new XMLFactory(xml)
+      .encodeAttribute('MeasureDescription', 'HasDropBox')
+      .encodeAttribute('Measure', 'Type')
+      .toString();
+  });
+
+  const gradebookNode = first(xmlObject && xmlObject.Gradebook) || {};
+  const currentPeriodNode = first(gradebookNode.ReportingPeriod) || null;
+  const reportingPeriodsNode = first(gradebookNode.ReportingPeriods) || {};
+  const courseNodes = toArray((first(gradebookNode.Courses) || {}).Course);
+
+  return {
+    courses: courseNodes.map(function(course) {
+      const mark = toArray((first(course && course.Marks) || {}).Mark)[0] || null;
+      return {
+        name: readRawAttr(course, '@_Title', 'Unknown Class'),
+        teacher: readRawAttr(course, '@_Staff', ''),
+        grade: readRawAttr(mark, '@_CalculatedScoreString', 'N/A'),
+        score: readRawNumber(mark, '@_CalculatedScoreRaw'),
+        assignments: toArray((first(mark && mark.Assignments) || {}).Assignment).map(function(assignment) {
+          return {
+            name: readRawAttr(assignment, '@_Measure', 'Assignment'),
+            category: readRawAttr(assignment, '@_Type', ''),
+            score: readRawAttr(assignment, '@_Score', 'Not Graded'),
+            maxScore: readRawAttr(assignment, '@_ScoreType', ''),
+            date: readRawAttr(assignment, '@_Date', ''),
+            notes: readRawAttr(assignment, '@_Notes', '')
+          };
+        })
+      };
+    }),
+    reportingPeriod: {
+      current: currentPeriodNode ? {
+        name: readRawAttr(currentPeriodNode, '@_GradePeriod', ''),
+        index: quarter !== null && quarter !== undefined ? quarter : readRawNumber(currentPeriodNode, '@_Index'),
+        date: {
+          start: readRawAttr(currentPeriodNode, '@_StartDate', ''),
+          end: readRawAttr(currentPeriodNode, '@_EndDate', '')
+        }
+      } : null,
+      available: toArray(reportingPeriodsNode.ReportPeriod).map(function(period) {
+        return {
+          name: readRawAttr(period, '@_GradePeriod', ''),
+          index: readRawNumber(period, '@_Index'),
+          date: {
+            start: readRawAttr(period, '@_StartDate', ''),
+            end: readRawAttr(period, '@_EndDate', '')
+          }
+        };
+      })
+    }
+  };
+}
+
+async function fetchGradebookSafely(client, quarter) {
+  try {
+    return normalizeLibraryGradebook(
+      await client.gradebook(quarter !== null && quarter !== undefined ? quarter : undefined)
+    );
+  } catch (err) {
+    const message = String((err && err.message) || err || '');
+    if (!message.includes('Cannot read properties of undefined') && !message.includes("reading '0'")) {
+      throw err;
+    }
+
+    console.warn('[gradebook fallback] StudentVUE parser crashed, retrying with raw parsing.');
+    return fetchRawGradebook(client, quarter);
+  }
+}
+
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../Frontend')));
 
-// =========================================================
-// POST /api/grades - ROBUST VERSION
-// =========================================================
 app.post('/api/grades', async function(req, res) {
   const { username, password } = req.body;
+  const quarter = parseInt(req.query.quarter, 10) || null;
 
   if (!username || !password) {
     return res.status(400).json({ error: 'Username and password are required.' });
   }
 
   try {
-    // Login to StudentVUE
     const client = await studentVueApi.login(DISTRICT_URL, {
       username: String(username).trim(),
       password: String(password)
     });
 
-    // Fetch gradebook with error catching
-    let gradebook;
-    try {
-      gradebook = await client.gradebook();
-    } catch (fetchErr) {
-      console.error('gradebook() call failed:', fetchErr.message);
-      throw fetchErr;
-    }
+    const gradebook = await fetchGradebookSafely(client, quarter);
 
-    // Fetch student name (optional - don't fail if this breaks)
     let studentName = 'Student';
     try {
       const info = await client.studentInfo();
-      studentName = info?.student?.name || 'Student';
-    } catch (e) {
-      // Ignore - student name is not critical
-    }
+      studentName = info && info.student && info.student.name ? info.student.name : 'Student';
+    } catch (e) {}
 
-    // === VERY DEFENSIVE COURSE & ASSIGNMENT PARSING ===
-    const courses = (gradebook?.courses || []).map(function(course) {
-      // Safely get the current mark
-      const marksObj = course?.Marks || {};
-      const mark = marksObj.Mark || (Array.isArray(marksObj) ? marksObj[0] : {});
+    const courses = toArray(gradebook && gradebook.courses);
+    const note = courses.length && courses.every(function(course) {
+      return !course || !course.grade || course.grade === 'N/A';
+    })
+      ? 'No grades have been entered yet for the current quarter.'
+      : null;
 
-      const rawAssignments = [];
-
-      // Safely extract assignments
-      if (mark?.Assignments?.Assignment) {
-        let assignmentList = mark.Assignments.Assignment;
-
-        // Normalize to array (StudentVUE sometimes returns single object instead of array)
-        if (!Array.isArray(assignmentList)) {
-          assignmentList = assignmentList ? [assignmentList] : [];
-        }
-
-        assignmentList.forEach(function(a) {
-          if (!a) return; // skip any null/undefined entries
-
-          rawAssignments.push({
-            name:     a.Measure     || 'Assignment',
-            category: a.Type        || '',
-            score:    a.Score       || 'Not Graded',
-            maxScore: a.ScoreType   || '',
-            date:     a.Date        || '',
-            notes:    a.Notes       || ''
-          });
-        });
-      }
-
-      return {
-        name:        course?.Title           || 'Unknown Class',
-        teacher:     course?.Staff           || '',
-        grade:       mark?.CalculatedScoreString || 'N/A',
-        score:       mark?.CalculatedScoreRaw    || null,
-        assignments: rawAssignments
-      };
+    return res.json({
+      studentName: studentName,
+      courses: courses,
+      note: note
     });
-
-    return res.json({ 
-      studentName, 
-      courses 
-    });
-
   } catch (err) {
     const safeMessage = sanitizeErrorMessage(err);
     const classified = classifyStudentVueError(safeMessage);
@@ -193,16 +273,10 @@ app.post('/api/grades', async function(req, res) {
   }
 });
 
-// =========================================================
-// Catch-all: serve the frontend
-// =========================================================
 app.get('*', function(req, res) {
   res.sendFile(path.join(__dirname, '../Frontend/index.html'));
 });
 
-// =========================================================
-// Start server
-// =========================================================
 app.listen(PORT, function() {
   console.log(`StudyHub server running on http://localhost:${PORT}`);
 });
