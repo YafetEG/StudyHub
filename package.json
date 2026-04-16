@@ -1,0 +1,18 @@
+{
+  "name": "studyhub-server",
+  "version": "1.0.0",
+  "description": "StudyHub backend server — proxies StudentVUE grade data",
+  "main": "Server/server-debug.js",
+  "scripts": {
+    "start": "node Server/server-debug.js",
+    "dev": "node Server/server-debug.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "studentvue": "^1.1.5"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
